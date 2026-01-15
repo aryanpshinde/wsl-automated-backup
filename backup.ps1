@@ -20,6 +20,9 @@ $distroName = $config.distroName
 $remote     = $config.rcloneRemote
 $logFile    = "$backupDir\backup.log"
 
+$retentionLocal  = $config.retentionLocal
+$retentionCloud  = $config.retentionCloud
+
 # ==========================================================
 # Auto-detect distro name if empty
 # ==========================================================
@@ -182,12 +185,12 @@ switch($Mode){
     # ==============================
     # RETENTION (LOCAL 3 DAYS)
     # ==============================
-    Blue "Applying local retention (3 days)..."
+    Blue "Applying local retention ($retentionLocal days)..."
 
     Get-ChildItem $backupDir -File |
         Where-Object {
             $_.Extension -eq ".zst" -and
-            $_.LastWriteTime -lt (Get-Date).AddDays(-3)
+            $_.LastWriteTime -lt (Get-Date).AddDays(-$retentionLocal)
         } |
         ForEach-Object {
             Yellow "Deleting old local backup: $($_.Name)"
@@ -197,8 +200,8 @@ switch($Mode){
     # ==============================
     # RETENTION (CLOUD 7 DAYS)
     # ==============================
-    Blue "Applying cloud retention (7 days)..."
-    rclone delete $remote --min-age "7d"
+    Blue "Applying cloud retention ($retentionCloud days)..."
+    rclone delete $remote --min-age "${retentionCloud}d"
 
     # ==============================
     # SUMMARY
@@ -284,3 +287,4 @@ default {
     Green "  wsl-backup restore-latest"
 }
 }
+
