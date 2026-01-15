@@ -106,4 +106,7 @@ Verification OK.
 
 ## 📝 License
 
-This project is open-source. Feel free to use it to secure your own dev environments.
+This project is licensed under the MIT License.
+You are free to use, modify, distribute, and integrate this code in personal or commercial projects, as long as you include the original license notice.
+
+See the full license text in the LICENSE file.
