@@ -1,290 +1,288 @@
 param([string]$Mode="help")
 
 # ==========================================================
-# Helper Functions
+# UI & FORMATTING CONSTANTS
 # ==========================================================
-function C($t,$c){ Write-Host $t -ForegroundColor $c }
-function Green($t){ C $t "Green" }
-function Red($t){ C $t "Red" }
-function Yellow($t){ C $t "Yellow" }
-function Blue($t){ C $t "Cyan" }
+$esc = [char]27
+$RESET = "$esc[0m"
+$BOLD  = "$esc[1m"
+$CYAN  = "$esc[36m"
+$GREEN = "$esc[32m"
+$RED   = "$esc[31m"
+$YELLOW= "$esc[33m"
+$GRAY  = "$esc[90m"
 
-$ErrorActionPreference="Stop"
-
-# ==========================================================
-# Load Config
-# ==========================================================
-$config = Get-Content "C:\Tools\WSLBackup\config.json" | ConvertFrom-Json
-$backupDir  = $config.backupDir
-$distroName = $config.distroName
-$remote     = $config.rcloneRemote
-$logFile    = "$backupDir\backup.log"
-
-$retentionLocal  = $config.retentionLocal
-$retentionCloud  = $config.retentionCloud
-
-# ==========================================================
-# Auto-detect distro name if empty
-# ==========================================================
-if(!$distroName -or $distroName -eq ""){
-    $line = (wsl -l).Split("`n")[1].Trim()
-    $distroName = $line.Split(" ")[0]
+function Print-Header($title) {
+    Write-Host ""
+    Write-Host "$CYAN$BOLD$title$RESET"
+    Write-Host "$GRAY$('='*40)$RESET"
 }
 
-# ==========================================================
-# Ensure backup directory exists
-# ==========================================================
-if(!(Test-Path $backupDir)){
-    New-Item -ItemType Directory -Path $backupDir | Out-Null
-}
+function Log-Info($msg) { Write-Host "$GREEN[INFO] $RESET$msg" }
+function Log-Warn($msg) { Write-Host "$YELLOW[WARN] $RESET$msg" }
+function Log-Err($msg)  { Write-Host "$RED[FAIL] $RESET$msg" }
+function Log-Step($msg) { Write-Host "$BOLD[STEP] $msg...$RESET" }
 
-function Log($msg){
-    Add-Content $logFile "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
-}
+$ErrorActionPreference = "Stop"
 
 # ==========================================================
-# Ensure zstd exists
+# CONFIGURATION & SETUP
 # ==========================================================
-$zstd="C:\Tools\WSLBackup\zstd.exe"
-if(!(Test-Path $zstd)){
-    Red "ERROR: Missing zstd.exe at:"
-    Yellow "C:\Tools\WSLBackup\zstd.exe"
+$baseDir = $PSScriptRoot
+$configFile = Join-Path $baseDir "config.json"
+
+if (!(Test-Path $configFile)) {
+    Log-Err "Config file not found at: $configFile"
+    Write-Host ""
     exit 1
 }
 
-# ==========================================================
-# MD5 Helper
-# ==========================================================
-function MD5($file){
-    $md5 = New-Object System.Security.Cryptography.MD5CryptoServiceProvider
-    $fs = [IO.File]::OpenRead($file)
-    $hash = $md5.ComputeHash($fs)
-    $fs.Close()
-    ($hash | ForEach-Object ToString X2) -join ""
+$config = Get-Content $configFile | ConvertFrom-Json
+$backupDir      = $config.backupDir
+$distroName     = $config.distroName
+$remote         = $config.rcloneRemote
+$retentionLocal = $config.retentionLocal
+$retentionCloud = $config.retentionCloud
+$logFile        = Join-Path $backupDir "backup.log"
+
+if ([string]::IsNullOrWhiteSpace($distroName)) {
+    $distroName = (wsl -l -q).Split("`n")[0].Trim()
+}
+
+$zstdExe = Join-Path $baseDir "zstd.exe"
+if (!(Test-Path $zstdExe)) {
+    Log-Err "zstd.exe not found at $zstdExe"
+    Write-Host ""
+    exit 1
+}
+
+if (!(Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir | Out-Null }
+
+function Write-Log($msg) {
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content $logFile "$ts  $msg"
 }
 
 # ==========================================================
-# Export Progress Bar
+# CORE FUNCTIONS
 # ==========================================================
-function ProgressBar($cur,$max){
-    if($max -lt 1){ $max = 1 }
-    $p = [math]::Floor(($cur/$max)*100)
-    if($p -gt 100){ $p = 100 }
 
-    $bars = [math]::Floor($p/5)
-    if($bars -gt 20){ $bars = 20 }
+function Get-FastMD5($file) {
+    $hash = certutil -hashfile "$file" MD5 | Select-Object -Skip 1 -First 1
+    return $hash -replace " ",""
+}
 
-    $bar = "[" + ("#"*$bars) + ("-"*(20-$bars)) + "]"
-
-    $mbCur = [math]::Round($cur/1MB,1)
-    $mbMax = [math]::Round($max/1MB,1)
-
-    Write-Host ("Export:  $bar $p%  $mbCur MB / $mbMax MB") -ForegroundColor Yellow
+function Show-Progress($currentBytes, $startTime) {
+    $mb = [math]::Round($currentBytes / 1MB, 1)
+    $elapsed = (Get-Date) - $startTime
+    $speed = if ($elapsed.TotalSeconds -gt 0) { [math]::Round($mb / $elapsed.TotalSeconds, 1) } else { 0 }
+    
+    $spin = @('|', '/', '-', '\')
+    $idx = [math]::Floor($elapsed.TotalSeconds * 4) % 4
+    
+    Write-Host -NoNewline "`r$GRAY$($spin[$idx])$RESET Exporting: $CYAN$mb MB$RESET written @ $speed MB/s  "
 }
 
 # ==========================================================
-# Main Switch
+# MAIN LOGIC
 # ==========================================================
-switch($Mode){
+switch ($Mode) {
 
-# ==========================================================
-# DAILY BACKUP
-# ==========================================================
-"daily" {
-    Blue "== Backup Start =="
-    Log "Backup Started"
+    # ============================
+    # DAILY BACKUP ROUTINE
+    # ============================
+    "daily" {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Print-Header "🚀 STARTING DAILY BACKUP: $distroName"
+        Write-Log "Backup started for $distroName"
 
-    $ts = Get-Date -Format "yyyy-MM-dd_HH-mm"
-    $tempTar = "$backupDir\$distroName-$ts.raw.tar"
-    $outZst  = "$backupDir\$distroName-$ts.zst"
+        $ts = Get-Date -Format "yyyy-MM-dd_HH-mm"
+        $tempTar = Join-Path $backupDir "$distroName-$ts.raw.tar"
+        $outZst  = Join-Path $backupDir "$distroName-$ts.zst"
 
-    # ==============================
-    # EXPORT
-    # ==============================
-    Yellow "Exporting WSL distro..."
-    Log "Export started"
+        Log-Step "Exporting WSL Distribution"
+        
+        if (Test-Path $tempTar) { Remove-Item $tempTar -Force }
 
-    if(Test-Path $tempTar){ Remove-Item $tempTar -Force }
+        $proc = Start-Process wsl -ArgumentList "--export", $distroName, $tempTar -NoNewWindow -PassThru
+        $startExport = Get-Date
 
-    Start-Process wsl -ArgumentList "--export",$distroName,$tempTar -NoNewWindow -PassThru | Out-Null
+        while (!$proc.HasExited) {
+            if (Test-Path $tempTar) {
+                Show-Progress (Get-Item $tempTar).Length $startExport
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        Write-Host ""
 
-    $prev = 0
-    while($true){
-        Start-Sleep -Seconds 1
+        if ($proc.ExitCode -ne 0) {
+            Log-Err "WSL Export failed with exit code $($proc.ExitCode)"
+            Write-Log "Export failed"
+            Write-Host ""
+            exit 1
+        }
+        
+        $rawSize = (Get-Item $tempTar).Length
+        Log-Info "Export success. Raw size: $([math]::Round($rawSize/1GB, 2)) GB"
 
-        $size = 0
-        if(Test-Path $tempTar){
-            $size = (Get-Item $tempTar).Length
+        Log-Step "Compressing (zstd -10)"
+        $cmdArgs = "/c `"$zstdExe`" -10 `"$tempTar`" -o `"$outZst`" --rm"
+        Start-Process cmd.exe -ArgumentList $cmdArgs -NoNewWindow -Wait
+        
+        if (!(Test-Path $outZst)) {
+            Log-Err "Compression failed. Output file missing."
+            Write-Host ""
+            exit 1
+        }
+        $compSize = (Get-Item $outZst).Length
+        Log-Info "Compression success. Size: $([math]::Round($compSize/1GB, 2)) GB"
+
+        Log-Step "Syncing to Cloud ($remote)"
+        $rcloneArgs = @("copyto", "$outZst", "$remote/$($outZst | Split-Path -Leaf)", "--progress", "--transfers=2")
+        $upload = Start-Process rclone -ArgumentList $rcloneArgs -NoNewWindow -Wait -PassThru
+
+        if ($upload.ExitCode -ne 0) {
+            Log-Err "Cloud upload failed."
+            Write-Log "Cloud upload failed"
+            Write-Host ""
+            exit 1
         }
 
-        ProgressBar $size ($size + 200MB)
+        Log-Step "Verifying Integrity"
+        Write-Host -NoNewline "$GRAY   Computing Local Hash... $RESET"
+        $localHash = Get-FastMD5 $outZst
+        Write-Host "$GREEN OK $RESET"
 
-        if($size -eq $prev -and $size -gt 0){
-            Start-Sleep -Seconds 1
-            if((Get-Item $tempTar).Length -eq $size){
-                break
+        Write-Host -NoNewline "$GRAY   Fetching Remote Hash... $RESET"
+        $remoteHashObj = rclone md5sum "$remote/$($outZst | Split-Path -Leaf)"
+        if ($remoteHashObj) {
+            $remoteHash = $remoteHashObj.ToString().Split(" ")[0]
+        } else {
+            Log-Err "Could not fetch remote hash."
+            Write-Host ""
+            exit 1
+        }
+        Write-Host "$GREEN OK $RESET"
+
+        if ($localHash -ne $remoteHash) {
+            Log-Err "HASH MISMATCH! Backup corrupted."
+            Log-Err "Local:  $localHash"
+            Log-Err "Remote: $remoteHash"
+            Write-Host ""
+            exit 1
+        }
+        Log-Info "Integrity Verified."
+
+        Print-Header "🧹 RETENTION POLICY"
+        
+        $files = Get-ChildItem $backupDir -Filter "*.zst" | Sort-Object LastWriteTime
+        $cutoff = (Get-Date).AddDays(-$retentionLocal)
+        
+        foreach ($f in $files) {
+            if ($f.LastWriteTime -lt $cutoff) {
+                Log-Warn "Deleting old local backup: $($f.Name)"
+                Remove-Item $f.FullName -Force
             }
         }
 
-        $prev = $size
+        rclone delete $remote --min-age "${retentionCloud}d" | Out-Null
+        Log-Info "Cloud retention applied ($retentionCloud days)."
+
+        $sw.Stop()
+        Print-Header "✅ BACKUP SUCCESSFUL"
+        Write-Host "   📂 Distro:    $distroName"
+        Write-Host "   💾 Size:      $([math]::Round($compSize/1GB, 2)) GB (Raw: $([math]::Round($rawSize/1GB, 2)) GB)"
+        Write-Host "   ⏱️ Time:       $([math]::Round($sw.Elapsed.TotalMinutes, 1)) min"
+        Write-Host "   ☁️ Location:  $remote"
+        Write-Log "Backup completed successfully"
+        Write-Host ""
     }
 
-    Green "Export complete."
-    $rawSize = (Get-Item $tempTar).Length
-
-    # ==============================
-    # COMPRESSION
-    # ==============================
-    Blue "Compressing with zstd..."
-    cmd.exe /c "`"$zstd`" -10 `"$tempTar`" -o `"$outZst`" --rm" | Out-Null
-
-    $compSize = (Get-Item $outZst).Length
-
-    # ==============================
-    # CLOUD UPLOAD
-    # ==============================
-    Blue "Uploading to cloud..."
-
-    try { rclone mkdir $remote | Out-Null } catch {}
-
-    $upload = Start-Process rclone -ArgumentList @(
-        "copy", "$outZst", $remote,
-        "--progress",
-        "--transfers=1",
-        "--checkers=1",
-        "--drive-chunk-size","64M",
-        "--retries","5",
-        "--low-level-retries","10"
-    ) -NoNewWindow -Wait -PassThru
-
-    if($upload.ExitCode -ne 0){
-        Red "Cloud upload failed."
-        Log "Cloud upload failed"
-        exit 1
+    # ============================
+    # STATUS CHECK
+    # ============================
+    "status" {
+        Print-Header "📊 BACKUP STATUS"
+        $latest = Get-ChildItem $backupDir -Filter "*.zst" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        
+        if ($latest) {
+            $age = New-TimeSpan -Start $latest.LastWriteTime -End (Get-Date)
+            Write-Host "Last Local Backup:"
+            Write-Host "   📄 Name:  $($latest.Name)"
+            Write-Host "   📅 Date:  $($latest.LastWriteTime)"
+            if ($age.TotalHours -gt 25) {
+                Write-Host "   ⚠️ Status: OVERDUE ($([math]::Round($age.TotalHours, 0)) hours old)" -ForegroundColor Red
+            } else {
+                Write-Host "   ✅ Status: FRESH ($([math]::Round($age.TotalHours, 1)) hours old)" -ForegroundColor Green
+            }
+        } else {
+            Log-Warn "No local backups found."
+        }
+        Write-Host ""
     }
 
-    # ==============================
-    # VERIFICATION
-    # ==============================
-    Blue "Verifying integrity..."
+    # ============================
+    # RESTORE (SAFE MODE)
+    # ============================
+    "restore-latest" {
+        Print-Header "🚑 SAFE RESTORE PROTOCOL"
+        
+        Log-Step "Locating latest cloud backup"
+        $file = rclone lsl $remote | Sort-Object Size -Descending | Select-Object -First 1
+        
+        if (!$file) { 
+            Log-Err "No remote backups found."
+            Write-Host ""
+            exit 
+        }
+        
+        $fname = $file.ToString().Split(" ")[-1]
+        $localPath = Join-Path $backupDir $fname
+        Log-Info "Found: $fname"
 
-    $localMD5 = MD5 $outZst
-
-    $remoteMD5 = (
-        rclone md5sum $remote |
-        Select-String ([IO.Path]::GetFileName($outZst))
-    ).ToString().Split(" ")[0]
-
-    if($localMD5 -ne $remoteMD5){
-        Red "Verification FAILED"
-        exit 1
-    }
-
-    Green "Verification OK."
-
-    # ==============================
-    # RETENTION (LOCAL 3 DAYS)
-    # ==============================
-    Blue "Applying local retention ($retentionLocal days)..."
-
-    Get-ChildItem $backupDir -File |
-        Where-Object {
-            $_.Extension -eq ".zst" -and
-            $_.LastWriteTime -lt (Get-Date).AddDays(-$retentionLocal)
-        } |
-        ForEach-Object {
-            Yellow "Deleting old local backup: $($_.Name)"
-            Remove-Item $_.FullName -Force
+        if (!(Test-Path $localPath)) {
+            Log-Step "Downloading (This may take time)"
+            rclone copyto "$remote/$fname" $localPath --progress
+        } else {
+            Log-Info "File already exists locally, skipping download."
         }
 
-    # ==============================
-    # RETENTION (CLOUD 7 DAYS)
-    # ==============================
-    Blue "Applying cloud retention ($retentionCloud days)..."
-    rclone delete $remote --min-age "${retentionCloud}d"
+        $restoreName = "$distroName-Restored"
+        $restoreDir = Join-Path $backupDir $restoreName
+        $tempTar = Join-Path $backupDir "restore-temp.tar"
+        
+        if (wsl -l -q | Select-String -Quiet $restoreName) {
+            Log-Err "Distro '$restoreName' already exists!"
+            Log-Warn "Please run: wsl --unregister $restoreName"
+            Write-Host ""
+            exit 1
+        }
 
-    # ==============================
-    # SUMMARY
-    # ==============================
-    $ratio = [math]::Round(($rawSize/1MB)/($compSize/1MB),2)
+        Log-Step "Decompressing archive"
+        $cmdArgs = "/c `"$zstdExe`" -d `"$localPath`" -o `"$tempTar`" --rm"
+        Start-Process cmd.exe -ArgumentList $cmdArgs -NoNewWindow -Wait
 
-    Green "== Backup Summary =="
-    Green "Raw Size:      $([math]::Round($rawSize/1MB,1)) MB"
-    Green "Compressed:    $([math]::Round($compSize/1MB,1)) MB"
-    Green "Ratio:         $ratio x"
-    Green "Verified:      Yes"
-    Green "Saved Local:   $outZst"
-    Green "Saved Cloud:   $remote"
+        Log-Step "Importing to NEW distro: $restoreName"
+        New-Item -ItemType Directory -Path $restoreDir -Force | Out-Null
+        wsl --import $restoreName $restoreDir $tempTar
 
-    Log "Backup completed"
-}
+        Remove-Item $tempTar -Force
 
-# ==========================================================
-# STATUS
-# ==========================================================
-"status" {
-    Blue "Local backups:"
-    Get-ChildItem $backupDir -File |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 10
-}
-
-# ==========================================================
-# CLOUD LISTING
-# ==========================================================
-"list-cloud" {
-    Blue "Cloud backups:"
-    rclone ls $remote
-}
-
-# ==========================================================
-# RESTORE LATEST
-# ==========================================================
-"restore-latest" {
-
-    Blue "Searching for latest cloud backup..."
-
-    $file = rclone lsl $remote |
-        Sort-Object Size -Descending |
-        Select-Object -First 1
-
-    if(!$file){
-        Red "No cloud backups found."
-        exit
+        Print-Header "🎉 RESTORE COMPLETE"
+        Write-Host "Your backup has been restored as a SEPARATE distro: " -NoNewline; Write-Host "$restoreName" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "To switch to this version, run:"
+        Write-Host "   wsl -d $restoreName"
+        Write-Host ""
+        Write-Host "If satisfied, you can unregister the old one and rename this one."
+        Write-Host ""
     }
 
-    $name = $file.ToString().Split(" ")[-1]
-    $localZst = "$backupDir\$name"
-
-    Blue "Downloading $name..."
-    rclone copy "$remote/$name" $backupDir
-
-    Blue "Stopping WSL..."
-    wsl --shutdown
-
-    Blue "Removing old distro..."
-    wsl --unregister $distroName
-
-    $localTar = "$backupDir\restore.tar"
-
-    Blue "Decompressing..."
-    cmd.exe /c "`"$zstd`" -d `"$localZst`" -o `"$localTar`" --rm" | Out-Null
-
-    Blue "Importing..."
-    wsl --import $distroName "$backupDir" $localTar
-
-    Remove-Item $localTar -Force
-
-    Green "Restore completed successfully."
+    default {
+        Print-Header "🛠️ WSL BACKUP TOOL v2.0"
+        Write-Host "   wsl-backup daily           Run full backup"
+        Write-Host "   wsl-backup status          Check last backup age"
+        Write-Host "   wsl-backup restore-latest  Safe restore to new distro"
+        Write-Host ""
+    }
 }
-
-# ==========================================================
-default {
-    Yellow "Commands:"
-    Green "  wsl-backup daily"
-    Green "  wsl-backup status"
-    Green "  wsl-backup list-cloud"
-    Green "  wsl-backup restore-latest"
-}
-}
-
