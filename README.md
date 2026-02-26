@@ -1,112 +1,182 @@
-# wsl-automated-backup
-Automated, compressed, and cloud-synced backup for WSL.
+# WSL Automated Backup
 
-# 🛡️ WSL Automated Backup System
+Automated, compressed, and cloud-synced backup system for Windows Subsystem for Linux (WSL) distributions.
 
-> A professional-grade, "set-and-forget" disaster recovery pipeline for Windows Subsystem for Linux (WSL).
+## Overview
 
-**Current Status:** v1.0 (Production Ready)
+This system provides a production-grade disaster recovery pipeline for WSL environments. It automates the complete backup lifecycle: export, compression, cloud synchronization, integrity verification, and retention management. The tool treats your WSL distros as critical systems that deserve automated, audited backups.
 
-## 📖 Overview
+**Status:** Production Ready (v1.0)
 
-Standard WSL backups (`wsl --export`) are opaque, uncompressed, and manual. This system automates the entire lifecycle of a backup, treating your development environment like a production server.
+## Features
 
-It orchestrates **Export**, **Compression**, **Cloud Upload**, and **Verification** into a single command, featuring a custom-built stream parser to provide real-time progress feedback.
+- **Cold Backup Consistency**: Automatically terminates running distros before export to ensure filesystem consistency
+- **High-Ratio Compression**: ZSTD compression typically achieves 60-70% size reduction
+  - Example: 4.5GB Ubuntu distro → 1.5GB backup (2.99:1 ratio) in ~3 minutes
+- **Cloud Integration**: Native Rclone support for Google Drive, OneDrive, AWS S3, and 40+ backends
+- **Cryptographic Verification**: Post-upload hash validation (SHA256, SHA1, or MD5) to detect corruption or tampering
+- **Concurrency Locking**: Prevents overlapping backup runs; auto-recovers from stale locks
+- **Retention Policies**: Separate rotation schedules for local and cloud storage
+- **Pre-flight Validation**: Disk space checks, WSL health verification, and distro availability confirmation
+- **Safe Error Handling**: Automatic cleanup of partial files on failure
 
-## 🚀 Key Features
+## Requirements
 
-* **📊 Live Stream Parsing:** Intercepts the raw byte stream from `wsl --export` to calculate and display a real-time progress bar (a feature missing from native WSL tools).
-* **🗜️ High-Ratio Compression:** Uses **ZSTD (Facebook Zstandard)** to achieve ~60-70% reduction in size.
-    * *Benchmark:* Reduced a **4.5GB** Ubuntu image to **1.5GB** (2.99x ratio) in ~3 minutes.
-* **☁️ Cloud Synchronization:** deeply integrated with **Rclone** to push backups to Google Drive, OneDrive, or S3.
-* **🔒 Integrity Verification:** Automatically compares local and cloud file hashes/sizes to ensure zero corruption.
-* **♻️ Retention Policies:** Enforces separate rotation schedules for Local (e.g., 3 days) and Cloud (e.g., 7 days) storage.
+- Windows 10 (build 19041+) or Windows 11 with WSL2 enabled
+- PowerShell 7.2 or newer ([download](https://aka.ms/powershell))
+- WSL2 with at least one distribution installed
+- [Rclone](https://rclone.org) installed and configured with a remote
+- [Zstandard](https://github.com/facebook/zstd) (zstd.exe) placed in the script directory
+  - Quick install: `winget install zstandard`
 
-## 🛠️ Architecture
+## Installation
 
-The system operates as a layered pipeline:
+1. Clone or download this repository to a location on your system:
+   ```powershell
+   git clone https://github.com/yourusername/wsl-backup
+   cd wsl-backup
+   ```
 
-```mermaid
-graph LR
-A[WSL Distro] -->|Stream Export| B(Stream Parser)
-B -->|Raw TAR| C{ZSTD Compression}
-C -->|Archive .zst| D[Local Storage]
-D -->|Rclone Sync| E[Cloud Storage]
-E -->|Verify| F[Integrity Check]
+2. Download zstd.exe and place it in the script directory:
+   ```powershell
+   # On Windows, using curl:
+   curl -L https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-v1.5.5-win64.zip -o zstd.zip
+   Expand-Archive zstd.zip
+   Copy-Item zstd-v1.5.5-win64/zstd.exe .
+   Remove-Item zstd.zip, zstd-v1.5.5-win64 -Recurse
+   ```
+
+3. Configure Rclone with a remote backend:
+   ```powershell
+   rclone config
+   # Follow prompts to set up your cloud backend (e.g., 'gdrive', 'onedrive', 's3backup')
+   ```
+
+4. Create and edit config.json:
+   ```json
+   {
+       "backupDir": "C:\\WSL-Backups",
+       "distroName": "Ubuntu",
+       "rcloneRemote": "gdrive:WSL-Backups",
+       "retentionLocal": 7,
+       "retentionCloud": 30,
+       "compressionLevel": 10,
+       "hashAlgorithm": "SHA256"
+   }
+   ```
+
+5. (Optional) Add the script directory to your PATH for global access:
+   ```powershell
+   $scriptDir = "C:\path\to\wsl-backup"
+   [Environment]::SetEnvironmentVariable(
+       "Path",
+       [Environment]::GetEnvironmentVariable("Path") + ";$scriptDir",
+       "User"
+   )
+   ```
+
+## Configuration
+
+The config.json file controls all aspects of the backup behavior:
+
+### Required Fields
+
+| Field        | Type   | Description                                                                             |
+| ------------ | ------ | --------------------------------------------------------------------------------------- |
+| backupDir    | string | Local directory where backup archives are stored. Will be created if it does not exist. |
+| rcloneRemote | string | Rclone remote path in the format remote-name:path. Example: gdrive:WSL-Backups          |
+
+### Optional Fields
+
+| Field            | Type   | Default       | Description                                                               |
+| ---------------- | ------ | ------------- | ------------------------------------------------------------------------- |
+| distroName       | string | (auto-detect) | WSL distro name to back up. If empty, the first available distro is used. |
+| retentionLocal   | int    | 7             | Number of days to retain backups in local storage before deletion.        |
+| retentionCloud   | int    | 30            | Number of days to retain backups in cloud storage before deletion.        |
+| compressionLevel | int    | 10            | ZSTD compression level (1-19). Higher = smaller file, slower compression. |
+| hashAlgorithm    | string | SHA256        | Hash algorithm for integrity verification: SHA256, SHA1, or MD5.          |
+
+## Usage
+
+### Syntax
+
+```
+wsl-backup [command] [-ConfigPath <path>] [-WhatIf] [-Verbose] [-Force]
 ```
 
-## ⚙️ Configuration
+### Commands
 
-The system is controlled by a simple `config.json` file, separating logic from data:
+#### daily
 
-```json
-{
-    "backupDir": "C:\\WSL-Backups",
-    "distroName": "Ubuntu",
-    "rcloneRemote": "gdrive:WSL-Backups",
-    "retentionLocal": 3,
-    "retentionCloud": 7
-}
-```
-
-## 📦 Installation & Prerequisites
-
-### Requirements
-
-* **Windows 10/11** with WSL2 enabled.
-* **PowerShell 5.1** or newer.
-* **[ZSTD](https://github.com/facebook/zstd)** (available via `winget install zstd`).
-* **[Rclone](https://rclone.org)** (configured with a remote).
-
-### Setup
-
-1. Clone this repository.
-2. Edit `config.json` to match your paths and distro name.
-3. Add the folder to your Windows `PATH` (optional).
-
-## 🖥️ Usage
-
-Run the commands from PowerShell or CMD:
-
-### 1. Run a Daily Backup
-
-Performs the full pipeline: Export → Compress → Upload → Verify.
+Perform a complete backup cycle: export, compress, upload, verify, and apply retention.
 
 ```powershell
 wsl-backup daily
 ```
 
-### 2. View Status
+#### status
 
-Checks the last backup time and verify cloud connectivity.
+Display the current backup health, WSL distro state, and recent backup statistics.
 
 ```powershell
 wsl-backup status
 ```
 
-### 3. Restore
+#### restore-latest
 
-Disaster recovery workflow to restore a `.zst` archive to a fresh WSL instance.
+Display manual restore instructions for disaster recovery.
 
 ```powershell
 wsl-backup restore-latest
 ```
 
-## 📸 Demo Output
+#### help
 
-*Real-time feedback during the export process:*
+Display command syntax and available options.
 
-```text
-Export:  [###################-] 95%  4661.1 MB / 4861.1 MB
-Compressing with zstd...
-Ratio: 2.99 x
-Transferred: 1.52 GiB / 1.52 GiB, 100%
-Verification OK.
+```powershell
+wsl-backup help
 ```
 
-## 📝 License
+## Exit Codes
 
-This project is licensed under the MIT License.
-You are free to use, modify, distribute, and integrate this code in personal or commercial projects, as long as you include the original license notice.
+| Code | Meaning                                                       |
+| ---- | ------------------------------------------------------------- |
+| 0    | Success                                                       |
+| 1    | Configuration error, validation failure, or operation failure |
 
-See the full license text in the LICENSE file.
+## Architecture
+
+Pipeline Flow:
+
+```
+WSL Distro
+    │
+    ├─→ [Pre-flight Checks]
+    │   ├─ Admin rights
+    │   ├─ WSL health
+    │   ├─ Disk space
+    │   └─ Distro availability
+    │
+    ├─→ [Lock Acquisition]
+    │
+    ├─→ [Export]
+    │   └─ wsl --export → TAR
+    │
+    ├─→ [Compress]
+    │   └─ ZSTD compression
+    │
+    ├─→ [Upload]
+    │   └─ Rclone to cloud
+    │
+    ├─→ [Verify]
+    │   └─ Compare hashes
+    │
+    ├─→ [Retention]
+    │
+    └─→ [Lock Release]
+```
+
+## License
+
+Licensed under the MIT License. See LICENSE file for details.
