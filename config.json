@@ -2,7 +2,8 @@
     "backupDir": "C:\\WSL-Backups",
     "distroName": "Ubuntu",
     "rcloneRemote": "gdrive:WSL-Backups",
-    "retentionLocal": 3,
-    "retentionCloud": 30,
-    "logMaxSizeMB": 5
+    "retentionLocal": 1,
+    "retentionCloud": 3,
+    "compressionLevel": 10,
+    "hashAlgorithm": "SHA256"
 }
